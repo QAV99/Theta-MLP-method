@@ -1,0 +1,961 @@
+---
+title: "Theta-MLP method"
+author: "QAV"
+date: "2025-02-25"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+# Required functions
+```{r}
+# Libraries
+library("forecast")
+library("MAPA")
+library("parallel")
+library("smooth")
+library(keras3) # for server
+library(ggplot2)
+library(forecast)
+library(tensorflow)
+
+# Classical Theta Method
+Theta.classic <- function(input, fh) {
+  wses <- wlrl <- 0.5
+  theta <- 2
+  observations <- length(input)
+  xt <- 1:observations
+  xf <- (observations + 1):(observations + fh)
+  train <- data.frame(input = input, xt = xt)
+  test <- data.frame(xt = xf)
+  
+  estimate <- lm(input ~ poly(xt, 1, raw = TRUE))
+  thetaline0In <- as.numeric(predict(estimate))
+  thetaline0Out <- as.numeric(predict(estimate, test))
+  
+  thetalineT <- theta * input + (1 - theta) * thetaline0In
+  sesmodel <- ses(thetalineT, h = fh)
+  thetaline2In <- sesmodel$fitted
+  thetaline2Out <- sesmodel$mean
+  
+  forecastsIn <- (thetaline2In * wses) + (thetaline0In * wlrl)
+  forecastsOut <- (thetaline2Out * wses) + (thetaline0Out * wlrl)
+  
+  forecastsOut[forecastsOut < 0] <- 0
+  
+  output <- list(fitted = forecastsIn, mean = forecastsOut, 
+                 fitted0 = thetaline0In, mean0 = thetaline0Out, 
+                 fitted2 = thetaline2In, mean2 = thetaline2Out)
+  
+  return(output)
+}
+
+# sMAPE
+smape_cal <- function(outsample, forecasts) {
+  outsample <- as.numeric(outsample)
+  forecasts <- as.numeric(forecasts)
+  smape <- (abs(outsample - forecasts) * 200) / (abs(outsample) + abs(forecasts))
+  return(mean(smape))
+}
+
+# MASE
+mase_cal <- function(insample, outsample, forecasts) {
+  frq <- frequency(insample)
+  forecastsNaiveSD <- rep(NA, frq)
+  for (j in (frq + 1):length(insample)) {
+    forecastsNaiveSD <- c(forecastsNaiveSD, insample[j - frq])
+  }
+  masep <- mean(abs(insample - forecastsNaiveSD), na.rm = TRUE)
+  
+  outsample <- as.numeric(outsample)
+  forecasts <- as.numeric(forecasts)
+  mase <- (abs(outsample - forecasts)) / masep
+  return(mean(mase))
+}
+
+Names_benchmarks <- c("Naive", "sNaive", "Naive2", "SES", "Holt", "Damped", "Theta", "Com", "Theta-MLP")
+
+# Benchmarks + Theta-MLP method
+Benchmarks <- function(input, fh) {
+  frequency <- frequency(input)
+  seasonal_adjustment <- SeasonalAdjusted(input, frequency, fh)
+  des_input <- seasonal_adjustment$des_input
+  SIout <- seasonal_adjustment$SIout
+  
+  f1 <- naive(input, h = fh)$mean # Naive
+  f2 <- naive_seasonal(input, fh = fh) # Seasonal Naive
+  f3 <- naive(des_input, h = fh)$mean * SIout # Naive2
+  f4 <- ses(des_input, h = fh)$mean * SIout # SES
+  f5 <- holt(des_input, h = fh, damped = FALSE)$mean * SIout # Holt
+  f6 <- holt(des_input, h = fh, damped = TRUE)$mean * SIout # Damped
+  f7 <- Theta.classic(input = des_input, fh = fh)$mean * SIout # Theta
+  f8 <- (f4 + f5 + f6) / 3 # Combination
+  f9 <- theta_mlp(input = input, fh = fh, frq = frequency) 
+  
+  return(list(f1, f2, f3, f4, f5, f6, f7, f8, f9))
+}
+
+# Seasonal adjustments
+SeasonalAdjusted <- function(input, frequency, horizon) {
+  ST <- FALSE
+  # Check if the series is seasonal
+  if (frequency > 1) {
+    ST <- SeasonalityTest(input, frequency)
+  }
+  # If seasonal, perform decomposition
+  if (ST) {
+    Dec <- decompose(input, type = "multiplicative")
+    des_input <- input / Dec$seasonal
+    SIout <- head(rep(Dec$seasonal[(length(Dec$seasonal) - frequency + 1):length(Dec$seasonal)], horizon), horizon)
+  } else {
+    # If not seasonal, use the input as is and set seasonal indices to 1
+    des_input <- input
+    SIout <- rep(1, horizon)
+  }
+  return(list(des_input = des_input, SIout = SIout))
+}
+
+# Seasonality Test
+SeasonalityTest <- function(input, ppy) {
+  tcrit <- 1.645
+  if (length(input) < 3 * ppy) {
+    return(FALSE)
+  } else {
+    xacf <- acf(input, plot = FALSE)$acf[-1, 1, 1]
+    clim <- tcrit / sqrt(length(input)) * sqrt(cumsum(c(1, 2 * xacf^2)))
+    return(abs(xacf[ppy]) > clim[ppy])
+  }
+}
+
+# Seasonal Naive Method
+naive_seasonal <- function(input, fh) {
+  frcy <- frequency(input)
+  last_season <- tail(input, frcy)
+  repeated_seasons <- rep(last_season, ceiling(fh / frcy))
+  frcst <- head(repeated_seasons, fh)
+  return(frcst)
+}
+
+# Fitting the different Theta models
+Theta.models.fit <- function(input, fh, theta, curve, model, seasonality , plot=FALSE, positive=TRUE){
+  if (theta < 1) { theta <- 1 }
+  if (fh < 1) { fh <- 1 }
+  
+  outtest <- naive(input, h = fh)$mean
+  wses <- (1 / theta); wlrl <- (1 - wses)
+  
+  ppy <- frequency(input)
+  if (seasonality == "N") {
+    des_input <- input; SIout <- rep(1, fh); SIin <- rep(1, length(input))
+  } else if (seasonality == "A") {
+    Dec <- decompose(input, type = "additive")
+    des_input <- input - Dec$seasonal 
+    SIin <- Dec$seasonal
+    SIout <- head(rep(Dec$seasonal[(length(Dec$seasonal) - ppy + 1):length(Dec$seasonal)], fh), fh)
+  } else {
+    Dec <- decompose(input, type = "multiplicative")
+    des_input <- input / Dec$seasonal 
+    SIin <- Dec$seasonal
+    SIout <- head(rep(Dec$seasonal[(length(Dec$seasonal) - ppy + 1):length(Dec$seasonal)], fh), fh)
+  }
+  
+  observations <- length(des_input)
+  xs <- 1:observations
+  xf <- (observations + 1):(observations + fh)
+  dat <- data.frame(des_input = des_input, xs = xs)
+  newdf <- data.frame(xs = xf)
+  
+  if (curve == "Exp") {
+    estimate <- lm(log(des_input) ~ xs)
+    thetaline0In <- exp(predict(estimate)) + input - input
+    thetaline0Out <- exp(predict(estimate, newdf)) + outtest - outtest
+  } else {
+    estimate <- lm(des_input ~ poly(xs, 1, raw = TRUE))
+    thetaline0In <- predict(estimate) + des_input - des_input
+    thetaline0Out <- predict(estimate, newdf) + outtest - outtest
+  }
+  
+  if (model == "A") {
+    thetalineT <- theta * des_input + (1 - theta) * thetaline0In
+  } else {
+    thetalineT <- (des_input^theta) * (thetaline0In^(1 - theta))
+  }
+  
+  sesmodel <- ses(thetalineT, h = fh)
+  thetaline2In <- sesmodel$fitted
+  thetaline2Out <- sesmodel$mean
+  
+  if (model == "A") {
+    forecastsIn <- as.numeric(thetaline2In * wses) + as.numeric(thetaline0In * wlrl) + des_input - des_input
+    forecastsOut <- as.numeric(thetaline2Out * wses) + as.numeric(thetaline0Out * wlrl) + outtest - outtest
+  } else {
+    forecastsIn <- ((as.numeric(thetaline2In)^(1 / theta)) * (as.numeric(thetaline0In)^(1 - (1 / theta)))) + des_input - des_input
+    forecastsOut <- ((as.numeric(thetaline2Out)^(1 / theta)) * (as.numeric(thetaline0Out)^(1 - (1 / theta)))) + outtest - outtest
+  }
+  
+  if (seasonality == "A") {
+    forecastsIn <- forecastsIn + SIin
+    forecastsOut <- forecastsOut + SIout
+  } else {
+    forecastsIn <- forecastsIn * SIin
+    forecastsOut <- forecastsOut * SIout
+  }
+  
+  if (positive == TRUE) {
+    for (i in 1:length(forecastsOut)) {
+      if (forecastsOut[i] < 0) { forecastsOut[i] <- 0 }
+    }
+  }
+  
+  if (plot == TRUE) {
+    united <- cbind(input, forecastsOut)
+    plot(united[, 1], col = "black", type = "l", main = paste("Model:", model, ",Curve:", curve, ",Theta:", theta), xlab = "Time", ylab = "Values",
+         ylim = c(min(united[, 1]) * 0.85, max(united[, 1]) * 1.15))
+    lines(forecastsIn, col = "green")
+    lines(forecastsOut, col = "green")
+    lines(thetaline2In, col = "blue")
+    lines(thetaline2Out, col = "blue")
+    lines(thetaline0In, col = "red")
+    lines(thetaline0Out, col = "red")
+  }
+  
+  output <- list(fitted = forecastsIn, mean = forecastsOut,
+                 fitted0 = thetaline0In, mean0 = thetaline0Out,
+                 fitted2 = thetaline2In, mean2 = thetaline2Out,
+                 model = paste(seasonality, model, curve, c(round(theta, 2)), round(sesmodel$model$par[1], 3), round(sesmodel$model$par[2], 3)))
+  
+  return(output)
+}
+
+# Extended Theta Model
+ExTheta <- function(input, fh, positive = TRUE) {
+  if (min(input) > 0) {
+    molist <- c("M", "A"); trlist <- c("Lrl", "Exp")
+  } else {
+    molist <- c("A"); trlist <- c("Lrl")
+  }
+  
+  base <- mean(input); input <- input / base
+  
+  ppy <- frequency(input); ST <- F
+  if (ppy > 1) { ST <- SeasonalityTest(input, ppy) }
+  if (ST == TRUE) {
+    selist <- c("M", "A")
+    listnames <- c()
+    for (i in 1:length(selist)) {
+      for (ii in 1:length(molist)) {
+        for (iii in 1:length(trlist)) {
+          listnames <- c(listnames, paste(selist[i], molist[ii], trlist[iii]))
+        }
+      }
+    }
+  } else {
+    listnames <- c()
+    for (ii in 1:length(molist)) {
+      for (iii in 1:length(trlist)) {
+        listnames <- c(listnames, paste("N", molist[ii], trlist[iii]))
+      }
+    }
+  }
+  
+  excluded <- c("N M Lrl", "A M Lrl", "A M Exp", "M M Lrl")
+  listnames <- listnames[!(listnames %in% excluded)]
+  modellist <- NULL
+  for (i in 1:length(listnames)) {
+    modellist[length(modellist) + 1] <- list(c(substr(listnames, 1, 1)[i], substr(listnames, 3, 3)[i], substr(listnames, 5, 7)[i]))
+  }
+  
+  errorsin <- c(); models <- NULL
+  
+  optfun <- function(x, input, fh, curve, model, seasonality) {
+    mean(abs(Theta.models.fit(input = input, fh, theta = x, curve, model, seasonality, plot = FALSE)$fitted - input))
+  }
+  
+  for (j in 1:length(listnames)) {
+    optTheta <- suppressWarnings(optimize(optfun, c(1:3), 
+                                          input = input, fh = fh, curve = modellist[[j]][3], model = modellist[[j]][2], 
+                                          seasonality = modellist[[j]][1])$minimum)
+    
+    fortheta <- Theta.models.fit(input = input, fh = fh, theta = optTheta, curve = modellist[[j]][3], model = modellist[[j]][2], 
+                                 seasonality = modellist[[j]][1], plot = F)
+    models[length(models) + 1] <- list(fortheta)
+    errorsin <- c(errorsin, mean(abs(input - fortheta$fitted)))
+  }
+  
+  selected.model <- models[[which.min(errorsin)]]
+  description <- selected.model$model
+  
+  frc <- selected.model$mean * base
+  fitted <- selected.model$fitted * base
+  residuals_t <- as.numeric(input * base - fitted)
+  
+  if (frequency(input) == 1) {
+    m <- 12
+  } else if (frequency(input) == 4) {
+    m <- 4
+  } else {
+    m <- 1
+  }
+  
+  pisl <- frc - 1.960 * sd(residuals_t) * sqrt(1 + m * (c(1:fh) - 1))
+  pisu <- frc + 1.960 * sd(residuals_t) * sqrt(1 + m * (c(1:fh) - 1))
+  if (positive == TRUE) {
+    pisl[pisl < 0] <- 0; pisu[pisu < 0] <- 0
+  }
+  output <- list(fitted = fitted, mean = frc, description = description, piu = pisu, pil = pisl) 
+  
+  return(output)
+}
+
+# Theta-MLP Method
+theta_mlp <- function(input, fh, frq) {
+  # Apply Box-Cox transformation
+  lambda <- BoxCox.lambda(input, method = "loglik", lower = 0, upper = 1)
+  data_bxcx <- BoxCox(input, lambda)
+  
+  fit_theta <- ExTheta(input = data_bxcx, fh = fh)
+  
+  # Inverse Box-Cox transformation of fitted values
+  fitted_values <- InvBoxCox(fit_theta$fitted, lambda)
+  
+  # Calculate residuals
+  residuals <- input - fitted_values
+  
+  # Prepare data for MLP
+  x_train <- matrix(residuals[-length(residuals)], ncol = 1)
+  y_train <- matrix(residuals[-1], ncol = 1)
+  
+  model <- keras_model_sequential() %>%
+    layer_dense(units = 100, activation = 'relu', input_shape = c(1)) %>%
+    layer_dropout(rate = 0.2) %>%
+    layer_dense(units = 50, activation = 'relu') %>%
+    layer_dropout(rate = 0.2) %>%
+    layer_dense(units = 1)
+  
+  # Compile model with a lower learning rate for better convergence
+  model %>% compile(
+    optimizer = optimizer_adam(learning_rate = 0.0005),
+    loss = 'mse'
+  )
+  
+  # Train the MLP model with more epochs
+  model %>% fit(x_train, y_train, epochs = epochs, batch_size = batch_size, verbose = verbose, validation_split = validation_split)
+  
+  # Forecast residuals with the trained MLP model
+  mlp_forecast <- numeric(fh)
+  x_test <- matrix(residuals[length(residuals)], ncol = 1)
+  
+  for (i in 1:fh) {
+    mlp_forecast[i] <- model %>% predict(x_test)
+    x_test <- matrix(mlp_forecast[i], ncol = 1)
+  }
+  
+  # Define a likelihood function to estimate phi
+  likelihood_function <- function(phi, actual, theta_forecast, mlp_correction) {
+    corrected_forecast <- theta_forecast + phi * mlp_correction
+    residuals <- actual - corrected_forecast
+    return(-sum(dnorm(residuals, mean = 0, sd = sd(residuals), log = TRUE))) # Negative log-likelihood
+  }
+  
+  # Optimize phi
+  opt_result <- optim(par = 1, fn = likelihood_function, 
+                      actual = tail(input, fh), 
+                      theta_forecast = InvBoxCox(fit_theta$mean, lambda), # Invert forecast
+                      mlp_correction = mlp_forecast)
+  
+  phi <- opt_result$par
+  
+  final_forecast <- InvBoxCox(fit_theta$mean, lambda) + phi * mlp_forecast
+  
+  return(ts(final_forecast, frequency = frq))
+}
+```
+
+
+##### Part II #####
+
+# Results DGP 1
+```{r}
+# Library
+library(ggplot2)
+
+# Parameters
+set.seed(123)  # To ensure reproducibility across simulations
+alpha <- 10
+beta <- 0.03
+A_daily <- 5
+B_daily <- 3
+A_weekly <- 2
+B_weekly <- 1
+sigma <- 1
+n <- 505  # Number of observations
+fh <- 48  # Forecast horizon
+Names_benchmarks <- c("Naive", "sNaive", "Naive2", "SES", "Holt", "Damped", "Theta", "Com", "Theta-MLP")
+
+# Initialized arrays used to store metrics for all simulations
+smape_results_1 <- matrix(0, nrow = length(Names_benchmarks), ncol = num_simulations)
+mase_results_1 <- matrix(0, nrow = length(Names_benchmarks), ncol = num_simulations)
+owa_results_1 <- matrix(0, nrow = length(Names_benchmarks), ncol = num_simulations)
+
+# Progress tracking
+for (sim in 1:num_simulations) {
+  cat(sprintf("Simulation: %d/%d (%.2f%% completed)\n", sim, num_simulations, (sim / num_simulations) * 100))
+  
+  # Time index
+  t <- 1:n
+  
+  # Components
+  trend <- beta * t
+  seasonality_daily <- A_daily * sin(2 * pi * t / 24) + B_daily * cos(2 * pi * t / 24)
+  seasonality_weekly <- A_weekly * sin(2 * pi * t / 168) + B_weekly * cos(2 * pi * t / 168)
+  noise <- rnorm(n, mean = 0, sd = sigma)
+  
+  # Time series generation
+  Y_t <- alpha + trend + seasonality_daily + seasonality_weekly + noise
+  Y_ts <- ts(Y_t, frequency = 24)
+  
+  # Split into training and testing sets
+  data_train <- ts(head(Y_ts, length(Y_ts) - fh), frequency = 24)
+  data_test <- ts(tail(Y_ts, fh), frequency = 24)
+  
+  dgp.1_train_ts <- list(data_train)
+  dgp.1_test_ts <- list(data_test)
+  
+  # Initialize placeholders for current simulation
+  smape_current <- mase_current <- array(NA, dim = c(length(Names_benchmarks), length(dgp.1_train_ts)))
+  
+  # Process benchmarks
+  for (i in 1:length(dgp.1_train_ts)) {
+    insample <- dgp.1_train_ts[[i]]
+    outsample <- dgp.1_test_ts[[i]]
+    forecasts <- Benchmarks(input = insample, fh = fh)  # Replace with actual benchmark function
+    
+    # Calculate sMAPE and MASE
+    for (j in 1:length(Names_benchmarks)) {
+      smape_current[j, i] <- smape_cal(outsample, forecasts[[j]])
+      mase_current[j, i] <- mase_cal(insample, outsample, forecasts[[j]])
+    }
+  }
+  
+  # Store results of the current simulation
+  smape_results_1[, sim] <- rowMeans(smape_current, na.rm = TRUE)
+  mase_results_1[, sim] <- rowMeans(mase_current, na.rm = TRUE)
+  
+  # Calculate OWA for each method
+  for (j in 1:length(Names_benchmarks)) {
+    mean_mase_ratio_1 <- mase_results_1[j, sim] / mase_results_1[3, sim]  # Assuming Naive2 as the baseline
+    mean_smape_ratio_1 <- smape_results_1[j, sim] / smape_results_1[3, sim]
+    owa_results_1[j, sim] <- (mean_mase_ratio_1 + mean_smape_ratio_1) / 2
+  }
+}
+
+# Calculate averages across all simulations
+average_smape_1 <- rowMeans(smape_results_1, na.rm = TRUE)
+average_mase_1 <- rowMeans(mase_results_1, na.rm = TRUE)
+average_owa_1 <- rowMeans(owa_results_1, na.rm = TRUE)
+
+# Create results table
+results_table_1 <- data.frame(
+  Method = Names_benchmarks,
+  Avg_sMAPE_1 = round(average_smape_1, 3),
+  Avg_MASE_1 = round(average_mase_1, 3),
+  Avg_OWA_1 = round(average_owa_1, 3)
+)
+
+# Print results table
+print("########### Averaged Metrics for Benchmarks + Theta-MLP (DGP 1) ###############")
+print(results_table_1)
+
+# Saving the results
+save(mase_results_1, smape_results_1, owa_results_1, file = "results_metrics_dgp1.RData")
+
+# Save results_table_1 as .RData
+save(results_table_1, file = "results_table_dgp1.RData")
+
+# Export results_table_1 to two separate CSV files
+write.csv(results_table_1, file = "results_table_dgp1.csv", row.names = FALSE)
+```
+
+# Results DGP 2 
+```{r}
+# Load required libraries
+library(ggplot2)
+
+# Parameters
+set.seed(123)  # Ensure reproducibility across simulations
+damping_factor <- 0.95
+num_simulations <- 20
+n <- 505  # Number of observations
+fh <- 48  # Forecast horizon
+
+# Names of all benchmarks
+Names_benchmarks <- c("Naive", "sNaive", "Naive2", "SES", "Holt", "Damped", "Theta", "Com", "Theta-MLP")
+
+# Initialize arrays to store metrics for all simulations
+smape_results_2 <- matrix(0, nrow = length(Names_benchmarks), ncol = num_simulations)
+mase_results_2 <- matrix(0, nrow = length(Names_benchmarks), ncol = num_simulations)
+owa_results_2 <- matrix(0, nrow = length(Names_benchmarks), ncol = num_simulations)
+
+# Run simulations
+for (sim in 1:num_simulations) {
+  cat(sprintf("Simulation %d/%d\n", sim, num_simulations))  # Progress indicator
+  
+  # Time index
+  time_hours <- 1:n
+  time_days <- time_hours / 24  # Convert hours to days
+  
+  # Components for DGP 2
+  trend <- (1 - damping_factor^time_hours) * 0.05 * time_hours
+  daily_seasonality <- 1 + 0.1 * sin(2 * pi * time_hours / 24)
+  weekly_seasonality <- 1 + 0.2 * sin(2 * pi * time_hours / (24 * 7))
+  noise <- rnorm(n, mean = 0, sd = 2)
+  
+  # Final time series
+  Y_t <- trend * daily_seasonality * weekly_seasonality + noise
+  
+  # Shift to ensure positivity
+  min_value <- min(Y_t)
+  if (min_value <= 0) {
+    shift <- abs(min_value) + 1
+    Y_t <- Y_t + shift
+  }
+  
+  # Convert to ts object
+  Y_ts <- ts(Y_t, frequency = 24)
+  
+  # Split into training and testing sets
+  data_train <- ts(head(Y_ts, length(Y_ts) - fh), frequency = 24)
+  data_test <- ts(tail(Y_ts, fh), frequency = 24)
+  
+  # Initialize placeholders for current simulation
+  smape_current <- mase_current <- array(NA, dim = c(length(Names_benchmarks), 1))
+  
+  # Process benchmarks
+  insample <- data_train
+  outsample <- data_test
+  forecasts <- Benchmarks(input = insample, fh = fh)  # Replace with actual benchmark function
+  
+  # Calculate sMAPE and MASE for each benchmark
+  for (j in 1:length(Names_benchmarks)) {
+    smape_current[j, 1] <- smape_cal(outsample, forecasts[[j]])
+    mase_current[j, 1] <- mase_cal(insample, outsample, forecasts[[j]])
+  }
+  
+  # Store results for the current simulation
+  smape_results_2[, sim] <- rowMeans(smape_current, na.rm = TRUE)
+  mase_results_2[, sim] <- rowMeans(mase_current, na.rm = TRUE)
+  
+  # Calculate OWA for each method
+  for (j in 1:length(Names_benchmarks)) {
+    mean_mase_ratio_2 <- mase_results_2[j, sim] / mase_results_2[3, sim]  # Assuming Naive2 as the baseline
+    mean_smape_ratio_2 <- smape_results_2[j, sim] / smape_results_2[3, sim]
+    owa_results_2[j, sim] <- (mean_mase_ratio_2 + mean_smape_ratio_2) / 2
+  }
+}
+
+# Calculate averages across all simulations
+average_smape_2 <- rowMeans(smape_results_2, na.rm = TRUE)
+average_mase_2 <- rowMeans(mase_results_2, na.rm = TRUE)
+average_owa_2 <- rowMeans(owa_results_2, na.rm = TRUE)
+
+# Create results table
+results_table_2 <- data.frame(
+  Method = Names_benchmarks,
+  Avg_sMAPE_2 = round(average_smape_2, 3),
+  Avg_MASE_2 = round(average_mase_2, 3),
+  Avg_OWA_2 = round(average_owa_2, 3)
+)
+
+# Print results table
+print("########### Averaged Metrics for Benchmarks + Theta-MLP (DGP 2) ###############")
+print(results_table_2)
+
+# Saving the results
+save(mase_results_2, smape_results_2, owa_results_2, file = "results_metrics_dgp2.RData")
+
+# Save results_table_2 as .RData
+save(results_table_2, file = "results_table_dgp2.RData")
+
+# Export results_table_2 to a CSV file
+write.csv(results_table_2, file = "results_table_dgp2.csv", row.names = FALSE)
+```
+
+# Results DGP 3
+```{r}
+# Setting seed for reproducibility
+set.seed(123)
+
+# Library
+library(ggplot2)
+
+# Parameters
+alpha <- 3
+beta <- 0.04 
+A_daily <- 6  
+B_daily <- 4
+A_weekly <- 3
+B_weekly <- 2
+sigma <- 0.5  
+n <- 505  
+fh <- 48  
+frq <- 24  
+num_simulations <- 20
+Names_benchmarks <- c("Naive", "sNaive", "Naive2", "SES", "Holt", "Damped", "Theta", "Com", "Theta-MLP")
+
+# Initialized arrays used to store metrics for all simulations
+smape_results_3 <- matrix(0, nrow = length(Names_benchmarks), ncol = num_simulations)
+mase_results_3 <- matrix(0, nrow = length(Names_benchmarks), ncol = num_simulations)
+owa_results_3 <- matrix(0, nrow = length(Names_benchmarks), ncol = num_simulations)
+
+# Simulations
+for (sim in 1:num_simulations) {
+  cat(sprintf("Simulation %d/%d\n", sim, num_simulations))  # Progress indicator
+  
+  # Time index
+  t <- 1:n
+  
+  # Components
+  trend <- alpha * exp(beta * t)  # Exponential growth
+  seasonality_daily <- A_daily * sin(2 * pi * t / 24) + B_daily * cos(2 * pi * t / 24)
+  seasonality_weekly <- A_weekly * sin(2 * pi * t / 168) + B_weekly * cos(2 * pi * t / 168)
+  noise <- rnorm(n, mean = 0, sd = sigma)
+  
+  # Time series generation
+  Y_t <- trend + seasonality_daily + seasonality_weekly + noise
+  
+  # Ensure positivity by shifting values if needed
+  min_value <- min(Y_t)
+  if (min_value <= 0) {
+    Y_t <- Y_t + abs(min_value) + 1
+  }
+  
+  # Split into training and testing sets
+  data_train <- ts(head(Y_t, length(Y_t) - fh), frequency = frq)
+  data_test <- ts(tail(Y_t, fh), frequency = frq)
+  
+  # Placeholder for forecasts
+  smape_current <- mase_current <- array(NA, dim = c(length(Names_benchmarks), 1))
+  
+  # Process benchmarks
+  insample <- data_train
+  outsample <- data_test
+  forecasts <- Benchmarks(input = insample, fh = fh)  # Replace with actual benchmark function
+  
+  # sMAPE and MASE for each benchmark
+  for (j in 1:length(Names_benchmarks)) {
+    smape_current[j, 1] <- smape_cal(outsample, forecasts[[j]])
+    mase_current[j, 1] <- mase_cal(insample, outsample, forecasts[[j]])
+  }
+  
+  # Store results for the current simulation
+  smape_results_3[, sim] <- rowMeans(smape_current, na.rm = TRUE)
+  mase_results_3[, sim] <- rowMeans(mase_current, na.rm = TRUE)
+  
+  # Calculate OWA for each method
+  for (j in 1:length(Names_benchmarks)) {
+    mean_mase_ratio_3 <- mase_results_3[j, sim] / mase_results_3[3, sim] 
+    mean_smape_ratio_3 <- smape_results_3[j, sim] / smape_results_3[3, sim]
+    owa_results_3[j, sim] <- (mean_mase_ratio_3 + mean_smape_ratio_3) / 2
+  }
+}
+
+# Calculate averages across all simulations
+average_smape_3 <- rowMeans(smape_results_3, na.rm = TRUE)
+average_mase_3 <- rowMeans(mase_results_3, na.rm = TRUE)
+average_owa_3 <- rowMeans(owa_results_3, na.rm = TRUE)
+
+# Create results table
+results_table_3 <- data.frame(
+  Method = Names_benchmarks,
+  Avg_sMAPE_3 = round(average_smape_3, 3),
+  Avg_MASE_3 = round(average_mase_3, 3),
+  Avg_OWA_3 = round(average_owa_3, 3)
+)
+
+# Print results table
+print("########### Averaged Metrics for Benchmarks + Theta-MLP (DGP 3) ###############")
+print(results_table_3)
+
+# Save the results
+save(mase_results_3, smape_results_3, owa_results_3, file = "results_metrics_dgp3.RData")
+
+# Save results_table_3 as .RData
+save(results_table_3, file = "results_table_dgp3.RData")
+
+# Export results_table_3 to a CSV file
+write.csv(results_table_3, file = "results_table_dgp3.csv", row.names = FALSE)
+```
+
+# Actual versus forecasted values (DGP 1)
+```{r}
+# Load required libraries
+library(ggplot2)
+library(forecast)
+
+# Parameters for DGP 1
+set.seed(123)
+alpha <- 10
+beta <- 0.03
+A_daily <- 5
+B_daily <- 3
+A_weekly <- 2
+B_weekly <- 1
+sigma <- 1
+n <- 505  # Number of observations
+fh <- 48  # Forecast horizon
+
+# Time index
+t <- 1:n
+
+# Components for DGP 1
+trend <- beta * t
+seasonality_daily <- A_daily * sin(2 * pi * t / 24) + B_daily * cos(2 * pi * t / 24)
+seasonality_weekly <- A_weekly * sin(2 * pi * t / 168) + B_weekly * cos(2 * pi * t / 168)
+noise <- rnorm(n, mean = 0, sd = sigma)
+
+# Generate time series
+Y_t <- alpha + trend + seasonality_daily + seasonality_weekly + noise
+Y_ts <- ts(Y_t, frequency = 24)
+
+# Split into training and testing sets
+train <- ts(head(Y_ts, length(Y_ts) - fh), frequency = 24)
+test <- ts(tail(Y_ts, fh), frequency = 24)
+
+# Use the Benchmarks function to generate forecasts
+forecasts <- Benchmarks(input = train, fh = fh)
+
+# Convert the forecasts list into a named list for easier handling in the plot
+forecast_names <- c("Naive", "sNaive", "Naive2", "SES", "Holt", "Damped", "Theta", "Comb", "Theta-MLP")
+forecast_values <- lapply(forecasts, function(x) as.numeric(x))
+names(forecast_values) <- forecast_names
+
+# Plot
+time_days <- t / 24  # Convert hours to days
+par(mar = c(6, 6, 5, 4) + 0.1, family = "serif")  # Set margin and font style
+
+plot(time_days, c(train, test), type = "n", ylim = range(c(train, test, unlist(forecast_values))), 
+     main = "Training, Actual, and Forecasted Values for simulation 1 of DGP 1",
+     cex.main = 1.8, font.main = 2,
+     xlab = "Time (Days)", ylab = "Value", cex.lab = 1.6, cex.axis = 1.4)
+
+# Adding Grid Lines
+grid(nx = NULL, ny = NULL, lty = 2, col = "gray")
+
+# Training Data (Blue Solid Line)
+lines(time_days[1:length(train)], train, col = "blue", lwd = 2, lty = 1)
+
+# Test Data (Red Solid Line)
+lines(time_days[(length(train) + 1):n], test, col = "red", lwd = 2, lty = 1)
+
+# Forecasts (Colored Dashed Lines)
+colors <- c("orange", "green", "purple", "darkred", "cyan", "pink", "darkblue", "black", "brown")
+line_types <- c(2, 3, 4, 5, 6, 7, 8, 1, 9)
+
+for (j in 1:length(forecast_values)) {
+  lines(time_days[(length(train) + 1):n], forecast_values[[j]], col = colors[j], lwd = 2, lty = line_types[j])
+}
+
+# Adding a Legend
+legend("topleft", legend = c("Training Data", "Actual (Test)", forecast_names), 
+       col = c("blue", "red", colors), lty = c(1, 1, line_types), lwd = c(2, 2, rep(2, length(forecast_values))), 
+       cex = 0.9, box.lty = 1, box.col = "black", ncol = 2)
+
+# Restore Default Margins
+par(mar = c(5, 4, 4, 2) + 0.1)
+```
+
+# Actual versus forecasted values (DGP 2)
+```{r}
+# Load required libraries
+library(ggplot2)
+library(forecast)
+
+# Parameters for DGP 2
+set.seed(123)
+damping_factor <- 0.95
+n <- 505  # Number of observations
+fh <- 48  # Forecast horizon
+
+# Time index
+time_hours <- 1:n
+time_days <- time_hours / 24  # Convert hours to days
+
+# Components for DGP 2
+trend <- (1 - damping_factor^time_hours) * 0.05 * time_hours
+daily_seasonality <- 1 + 0.1 * sin(2 * pi * time_hours / 24)
+weekly_seasonality <- 1 + 0.2 * sin(2 * pi * time_hours / (24 * 7))
+noise <- rnorm(n, mean = 0, sd = 2)
+
+# Generate time series
+Y_t <- trend * daily_seasonality * weekly_seasonality + noise
+
+# Ensure positivity
+min_value <- min(Y_t)
+if (min_value <= 0) {
+  Y_t <- Y_t + abs(min_value) + 1
+}
+
+# Convert to time series object
+Y_ts <- ts(Y_t, frequency = 24)
+
+# Split into training and testing sets
+train <- ts(head(Y_ts, length(Y_ts) - fh), frequency = 24)
+test <- ts(tail(Y_ts, fh), frequency = 24)
+
+# Use the Benchmarks function to generate forecasts
+forecasts <- Benchmarks(input = train, fh = fh)
+
+# Convert the forecasts list into a named list for easier handling in the plot
+forecast_names <- c("Naive", "sNaive", "Naive2", "SES", "Holt", "Damped", "Theta", "Comb", "Theta-MLP")
+forecast_values <- lapply(forecasts, function(x) as.numeric(x))
+names(forecast_values) <- forecast_names
+
+# Plot
+par(mar = c(6, 6, 5, 4) + 0.1, family = "serif")  # Set margin and font style
+
+plot(time_days, c(train, test), type = "n", ylim = range(c(train, test, unlist(forecast_values))), 
+     main = "Training, Actual, and Forecasted Values for simulation 1 of DGP 2",
+     cex.main = 1.8, font.main = 2,
+     xlab = "Time (Days)", ylab = "Value", cex.lab = 1.6, cex.axis = 1.4)
+
+# Adding Grid Lines
+grid(nx = NULL, ny = NULL, lty = 2, col = "gray")
+
+# Training Data (Blue Solid Line)
+lines(time_days[1:length(train)], train, col = "blue", lwd = 2, lty = 1)
+
+# Test Data (Red Solid Line)
+lines(time_days[(length(train) + 1):n], test, col = "red", lwd = 2, lty = 1)
+
+# Forecasts (Colored Lines: Theta-MLP is black solid line)
+colors <- c("orange", "green", "purple", "darkred", "cyan", "pink", "darkblue", "brown", "black")  # Theta-MLP is black
+line_types <- c(2, 3, 4, 5, 6, 7, 8, 2, 1)  # Theta-MLP is solid (1)
+
+for (j in 1:length(forecast_values)) {
+  if (names(forecast_values)[j] == "Theta-MLP") {
+    lines(time_days[(length(train) + 1):n], forecast_values[[j]], col = "black", lwd = 2, lty = 1)  # Black solid line
+  } else {
+    lines(time_days[(length(train) + 1):n], forecast_values[[j]], col = colors[j], lwd = 2, lty = line_types[j])
+  }
+}
+
+# Adding a Legend
+legend("topleft", legend = c("Training Data", "Actual (Test)", forecast_names), 
+       col = c("blue", "red", colors), lty = c(1, 1, line_types), lwd = c(2, 2, rep(2, length(forecast_values))), 
+       cex = 0.9, box.lty = 1, box.col = "black", ncol = 2)
+
+# Restore Default Margins
+par(mar = c(5, 4, 4, 2) + 0.1)
+
+```
+
+# Actual versus forecasted values (DGP 3)
+```{r}
+# Load required libraries
+library(ggplot2)
+library(forecast)
+library(scales)  # For formatted axis labels
+
+# Parameters for DGP 3
+set.seed(123)
+alpha <- 3
+beta <- 0.04
+A_daily <- 6  
+B_daily <- 4
+A_weekly <- 3
+B_weekly <- 2
+sigma <- 0.5  
+n <- 505  # Number of observations
+fh <- 48  # Forecast horizon
+
+# Time index
+t <- 1:n
+time_days <- t / 24  # Convert hours to days
+
+# Components for DGP 3
+trend <- alpha * exp(beta * t)  # Exponential growth
+seasonality_daily <- A_daily * sin(2 * pi * t / 24) + B_daily * cos(2 * pi * t / 24)
+seasonality_weekly <- A_weekly * sin(2 * pi * t / 168) + B_weekly * cos(2 * pi * t / 168)
+noise <- rnorm(n, mean = 0, sd = sigma)
+
+# Generate time series
+Y_t <- trend + seasonality_daily + seasonality_weekly + noise
+
+# Ensure positivity
+min_value <- min(Y_t)
+if (min_value <= 0) {
+  Y_t <- Y_t + abs(min_value) + 1
+}
+
+# Convert to time series object
+Y_ts <- ts(Y_t, frequency = 24)
+
+# Split into training and testing sets
+train <- ts(head(Y_ts, length(Y_ts) - fh), frequency = 24)
+test <- ts(tail(Y_ts, fh), frequency = 24)
+
+# Use the Benchmarks function to generate forecasts
+forecasts <- Benchmarks(input = train, fh = fh)
+
+# Convert the forecasts list into a named list for easier handling in the plot
+forecast_names <- c("Naive", "sNaive", "Naive2", "SES", "Holt", "Damped", "Theta", "Comb", "Theta-MLP")
+forecast_values <- lapply(forecasts, function(x) as.numeric(x))
+names(forecast_values) <- forecast_names
+
+# Plot
+par(mar = c(6, 6, 5, 4) + 0.1, family = "serif")  # Set margin and font style
+
+# Main Plot Area
+plot(time_days, c(train, test), type = "n", 
+     ylim = range(c(train, test, unlist(forecast_values))), 
+     main = "Training, Actual, and Forecasted Values for simulation 1 of DGP 3",
+     cex.main = 1.8, font.main = 2,
+     xlab = "Time (Days)", ylab = "Value", 
+     cex.lab = 1.6, cex.axis = 1.4,
+     xaxt = "n", yaxt = "n")  # Suppress default axis ticks
+
+# Custom x-axis (Days)
+axis(1, at = seq(min(time_days), max(time_days), length.out = 10),
+     labels = round(seq(min(time_days), max(time_days), length.out = 10), 1), 
+     cex.axis = 1.2)
+
+# Custom y-axis (Formatted values using scales::comma)
+axis(2, at = pretty(c(train, test, unlist(forecast_values))),
+     labels = scales::comma(pretty(c(train, test, unlist(forecast_values)))), 
+     cex.axis = 1.2)
+
+# Adding Grid Lines
+grid(nx = NULL, ny = NULL, lty = 2, col = "gray")
+
+# Training Data (Blue Solid Line)
+lines(time_days[1:length(train)], train, col = "blue", lwd = 2, lty = 1)
+
+# Test Data (Red Solid Line)
+lines(time_days[(length(train) + 1):n], test, col = "red", lwd = 2, lty = 1)
+
+# Forecasts (Colored Lines: Theta-MLP is black solid line)
+colors <- c("orange", "green", "purple", "darkred", "cyan", "pink", "darkblue", "brown", "black")  # Theta-MLP is black
+line_types <- c(2, 3, 4, 5, 6, 7, 8, 2, 1)  # Theta-MLP is solid (1)
+
+for (j in 1:length(forecast_values)) {
+  if (names(forecast_values)[j] == "Theta-MLP") {
+    lines(time_days[(length(train) + 1):n], forecast_values[[j]], col = "black", lwd = 2, lty = 1)  # Black solid line
+  } else {
+    lines(time_days[(length(train) + 1):n], forecast_values[[j]], col = colors[j], lwd = 2, lty = line_types[j])
+  }
+}
+
+# Adding a Legend
+legend("topleft", legend = c("Training Data", "Actual (Test)", forecast_names), 
+       col = c("blue", "red", colors), 
+       lty = c(1, 1, line_types), 
+       lwd = c(2, 2, rep(2, length(forecast_values))), 
+       cex = 0.9, box.lty = 1, box.col = "black", ncol = 2)
+
+# Restore Default Margins
+par(mar = c(5, 4, 4, 2) + 0.1)
+```
+
